@@ -1,0 +1,153 @@
+# Unity CI/CD Pipeline Template
+# Include via: include: local: 'Packages/com.kelsey.ci-pipeline/ci~/templates/unity-ci.yml'
+# The package must be a LOCAL package (file:) committed to the repo for include: local to work.
+
+variables:
+  IMAGE: unityci/editor
+  IMAGE_VERSION: 3
+  UNITY_DIR: $CI_PROJECT_DIR
+  CI_PKG: ${CI_PKG:-Packages/com.kelsey.ci-pipeline/ci~}
+  VERSION_NUMBER_VAR: $CI_COMMIT_REF_SLUG-$CI_PIPELINE_ID-$CI_JOB_ID
+  VERSION_BUILD_VAR: $CI_PIPELINE_IID
+
+image: $IMAGE:$UNITY_VERSION-base-$IMAGE_VERSION
+
+# ---------------------------------------------------------------------------
+# Reusable hidden jobs (use `extends:` in your concrete jobs)
+# ---------------------------------------------------------------------------
+
+# Tag format: build_{PLATFORM}_{BUILD_TYPE}/{Version}/{Number}
+# Examples:
+#   build_android_develop/1.0.0/001 (APK)
+#   build_android_release/1.0.0/123 (AAB)
+#   build_ios_release/1.0.0/001 (IPA)
+#   build_windows_release/1.0.0/001
+# PLATFORM: android | ios | windows
+# BUILD_TYPE: develop | release
+# Version: semver (1.0.0)
+# Number: build number, used for bundleVersionCode
+get-unity-version:
+  image: alpine
+  stage: prepare
+  variables:
+    GIT_DEPTH: 1
+  script:
+    - |
+      UNITY_VERSION=$(cat $UNITY_DIR/ProjectSettings/ProjectVersion.txt | grep "m_EditorVersion:.*" | awk '{ print $2}')
+      echo "UNITY_VERSION=$UNITY_VERSION" > prepare.env
+
+      if [ -n "$CI_COMMIT_TAG" ]; then
+        # Extract parts from tag: build_PLATFORM_BUILD_TYPE/VERSION/NUMBER
+        FULL_BUILD_TYPE=$(echo "$CI_COMMIT_TAG" | cut -d'/' -f1)
+        VERSION_NUMBER_VAR=$(echo "$CI_COMMIT_TAG" | cut -d'/' -f2)
+        VERSION_BUILD_VAR=$(echo "$CI_COMMIT_TAG" | cut -d'/' -f3)
+        
+        # Validate format
+        if [ -z "$FULL_BUILD_TYPE" ] || [ -z "$VERSION_NUMBER_VAR" ] || [ -z "$VERSION_BUILD_VAR" ]; then
+          echo "::error Tag format invalid. Expected: build_PLATFORM_BUILD_TYPE/VERSION/NUMBER (e.g. build_android_develop/1.0.0/001)"
+          exit 1
+        fi
+        
+        # Extract platform and build type from FULL_BUILD_TYPE (e.g. build_android_develop)
+        PLATFORM=$(echo "$FULL_BUILD_TYPE" | sed 's/^build_\([^_]*\)_.*/\1/')
+        BUILD_TYPE=$(echo "$FULL_BUILD_TYPE" | sed 's/^build_[^_]*_//')
+        
+        # Validate platform
+        case "$PLATFORM" in
+          android|ios|windows) ;;
+          *)
+            echo "::error PLATFORM must be 'android', 'ios', or 'windows'. Got: $PLATFORM"
+            exit 1
+            ;;
+        esac
+        
+        # Validate build type
+        if [ "$BUILD_TYPE" != "develop" ] && [ "$BUILD_TYPE" != "release" ]; then
+          echo "::error BUILD_TYPE must be 'develop' or 'release'. Got: $BUILD_TYPE"
+          exit 1
+        fi
+        
+        # Validate number is numeric
+        case "$VERSION_BUILD_VAR" in *[!0-9]*) echo "::error Number must be numeric. Got: $VERSION_BUILD_VAR"; exit 1;; esac
+        
+        # Store for later use
+        BUILD_TYPE="build_${PLATFORM}_${BUILD_TYPE}"
+      else
+        BUILD_TYPE=""
+        VERSION_NUMBER_VAR="$CI_COMMIT_REF_SLUG-$CI_PIPELINE_ID-$CI_JOB_ID"
+        VERSION_BUILD_VAR="$CI_PIPELINE_IID"
+      fi
+
+      echo "BUILD_TYPE=$BUILD_TYPE" >> prepare.env
+      echo "VERSION_NUMBER_VAR=$VERSION_NUMBER_VAR" >> prepare.env
+      echo "VERSION_BUILD_VAR=$VERSION_BUILD_VAR" >> prepare.env
+  artifacts:
+    reports:
+      dotenv: prepare.env
+
+.unity_before_script:
+  before_script:
+    - chmod +x ./$CI_PKG/before_script.sh && ./$CI_PKG/before_script.sh
+  needs:
+    - job: get-unity-version
+      artifacts: true
+
+.unity_after_script:
+  after_script:
+    - chmod +x ./$CI_PKG/return_license.sh && ./$CI_PKG/return_license.sh
+
+.cache:
+  cache:
+    key: "$CI_PROJECT_NAMESPACE-$CI_PROJECT_NAME-$CI_COMMIT_REF_SLUG-$TEST_PLATFORM"
+    paths:
+      - $UNITY_DIR/Library/
+      - $UNITY_DIR/../unity-builder
+
+.license:
+  rules:
+    - if: '$UNITY_LICENSE != null || $UNITY_SERIAL != null'
+      when: always
+
+.unity_defaults:
+  extends:
+    - .unity_before_script
+    - .cache
+    - .license
+    - .unity_after_script
+
+.build:
+  stage: build_and_test
+  extends: .unity_defaults
+  script:
+    - chmod +x ./$CI_PKG/build.sh && ./$CI_PKG/build.sh
+  artifacts:
+    paths:
+      - $UNITY_DIR/Builds/
+
+.test:
+  stage: build_and_test
+  extends: .unity_defaults
+  script:
+    - chmod +x ./$CI_PKG/test.sh && ./$CI_PKG/test.sh
+  artifacts:
+    when: always
+    expire_in: 2 weeks
+  coverage: /<Linecoverage>(.*?)</Linecoverage>/
+
+.test-with-junit-reports:
+  stage: build_and_test
+  extends: .unity_defaults
+  script:
+    - apt-get update && apt-get install -y default-jre libsaxonb-java
+    - chmod +x ./$CI_PKG/test.sh && ./$CI_PKG/test.sh
+    - saxonb-xslt -s $UNITY_DIR/$TEST_PLATFORM-results.xml -xsl $CI_PROJECT_DIR/$CI_PKG/nunit-transforms/nunit3-junit.xslt >$UNITY_DIR/$TEST_PLATFORM-junit-results.xml
+  artifacts:
+    when: always
+    paths:
+      - $UNITY_DIR/$TEST_PLATFORM-coverage/
+    reports:
+      junit:
+        - $UNITY_DIR/$TEST_PLATFORM-junit-results.xml
+        - "$UNITY_DIR/$TEST_PLATFORM-coverage/coverage.xml"
+    expire_in: 2 weeks
+  coverage: /<Linecoverage>(.*?)</Linecoverage>/
